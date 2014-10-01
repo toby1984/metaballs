@@ -231,7 +231,7 @@ public final class Main extends JFrame {
 			frameCount++;
 			final int fps = (int) ( 1000.0f/ ( totalTime / (float) frameCount ) );
 
-			g.setColor( Color.GREEN );
+			g.setColor( Color.BLUE );
 			final StringBuilder stringBuilder = new StringBuilder().append("FPS: ").append(fps).append(" (").append(delta).append(" ms total, ").append(calcTime ).append(" ms calc, ").append(renderTime).append(" ms rendering)  |  Press 'g' to toggle gradient display  |  Press <SPACE> to halt animation");
 			g.drawString(stringBuilder.toString(),10,10);
 
