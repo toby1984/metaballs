@@ -8,8 +8,8 @@ Although I spent some time on performance tweaking, the actual implementation is
 Build requirements
 ------------------
 
-JDK >= 1.8
-Maven >= 2.2.1
+* JDK >= 1.8
+* Maven >= 2.2.1
 
 To run
 ------
