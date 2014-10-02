@@ -14,6 +14,13 @@ public class MetaBall {
 		this.velocity.set(velocity);
 	}
 
+	public float dst2(float x,float y)
+	{
+		final float dx = position.x - x;
+		final float dy = position.y - y;
+		return dx*dx+dy*dy;
+	}
+
 	public void move(Vec2d min,Vec2d max) {
 
 		float newX = position.x + velocity.x;

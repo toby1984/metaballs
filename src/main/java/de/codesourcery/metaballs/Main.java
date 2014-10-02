@@ -26,6 +26,8 @@ import javax.swing.JFrame;
 import javax.swing.JPanel;
 import javax.swing.Timer;
 
+import de.codesourcery.metaballs.Grid.IVisitor;
+
 public final class Main extends JFrame {
 
 	public static final int BALL_COUNT =40;
@@ -48,9 +50,9 @@ public final class Main extends JFrame {
 	public static final int BENCHMARK_FRAMES = 2000;
 	public static final boolean BENCHMARK_MODE = false;
 
-	protected MetaBall[] metaBalls = new MetaBall[0];
-
 	protected final long startup = System.currentTimeMillis();
+
+	protected final Grid grid = new Grid( MODEL_WIDTH , MODEL_HEIGHT );
 
 	public Main() {
 		super("metaballs");
@@ -247,16 +249,27 @@ public final class Main extends JFrame {
 
 		protected float getDensity(float x,float y)
 		{
-			float sum = 0;
-			for ( int i = 0 ; i < BALL_COUNT ; i++ )
-			{
-				final MetaBall ball = metaBalls[i];
-				final float dx = x - ball.position.x;
-				final float dy = y - ball.position.y;
-				final float squaredDistance = dx*dx + dy*dy;
-				sum += ball.radiusSquared / squaredDistance;
-			}
-			return sum;
+			final IVisitor densityCalculator = new IVisitor() {
+
+				private float sum = 0;
+
+				@Override
+				public void visit(MetaBall ball)
+				{
+					final float dx = x - ball.position.x;
+					final float dy = y - ball.position.y;
+					final float squaredDistance = dx*dx + dy*dy;
+					sum += ball.radiusSquared / squaredDistance;
+				}
+
+				@Override
+				public float getResult() {
+					return sum;
+				}
+			};
+
+			grid.visitClosest( x , y ,  densityCalculator );
+			return densityCalculator.getResult();
 		}
 	}
 
@@ -307,7 +320,7 @@ public final class Main extends JFrame {
 	{
 		// setup random meta-balls
 		final Random rnd = new Random(System.currentTimeMillis());
-		metaBalls = new MetaBall[ BALL_COUNT ];
+		final List<MetaBall> metaBalls = new ArrayList<>( BALL_COUNT );
 		for ( int i = 0 ; i < BALL_COUNT ; i++ )
 		{
 			final float r = MIN_RADIUS + rnd.nextFloat()*(MAX_RADIUS-MIN_RADIUS);
@@ -316,8 +329,11 @@ public final class Main extends JFrame {
 
 			final float vx = MIN_VELOCITY + rnd.nextFloat()*(MAX_VELOCITY-MIN_VELOCITY);
 			final float vy = MIN_VELOCITY + rnd.nextFloat()*(MAX_VELOCITY-MIN_VELOCITY);
-			metaBalls[i] = new MetaBall(new Vec2d(x,y), r , new Vec2d(vx,vy ) );
+			metaBalls.add( new MetaBall(new Vec2d(x,y), r , new Vec2d(vx,vy ) ) );
 		}
+
+		grid.add( metaBalls );
+		grid.refresh();
 
 		final MyPanel panel = new MyPanel();
 		panel.setPreferredSize( new Dimension(600,400 ) );
@@ -348,15 +364,23 @@ public final class Main extends JFrame {
 
 		setVisible(true);
 
+		final IVisitor mover = new IVisitor() {
+
+			@Override
+			public void visit(MetaBall ball) {
+				ball.move( MIN, MAX );
+			}
+
+			@Override
+			public float getResult() { return 0; }
+		};
+
 		final Timer timer = new Timer(16, event ->
 		{
 			if ( ! paused.get() )
 			{
-				for ( int i = 0 ; i < BALL_COUNT ; i++ )
-				{
-					final MetaBall ball = metaBalls[i];
-					ball.move( MIN , MAX);
-				}
+				grid.visitAll( mover );
+				grid.refresh();
 				panel.repaint();
 			}
 		});
