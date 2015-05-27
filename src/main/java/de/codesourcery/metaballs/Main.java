@@ -5,11 +5,18 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.Graphics2D;
+import java.awt.GraphicsConfiguration;
+import java.awt.GraphicsEnvironment;
 import java.awt.Rectangle;
+import java.awt.Toolkit;
+import java.awt.Transparency;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
+import java.awt.image.ConvolveOp;
 import java.awt.image.DataBufferInt;
+import java.awt.image.Kernel;
+import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
@@ -24,7 +31,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import javax.swing.JFrame;
 import javax.swing.JPanel;
-import javax.swing.Timer;
+import javax.swing.SwingUtilities;
 
 import de.codesourcery.metaballs.Grid.IVisitor;
 
@@ -36,10 +43,10 @@ public final class Main extends JFrame {
 	public static final float MAX_RADIUS = 30;
 
 	public static final float MIN_VELOCITY = 0.1f;
-	public static final float MAX_VELOCITY = 2.0f;
+	public static final float MAX_VELOCITY = 50.0f;
 
-	public static final float MODEL_WIDTH  = 640;
-	public static final float MODEL_HEIGHT = 480;
+	public static final float MODEL_WIDTH  = 800;
+	public static final float MODEL_HEIGHT = 600;
 
 	public static final float HALF_MODEL_WIDTH  = MODEL_WIDTH/2.0f;
 	public static final float HALF_MODEL_HEIGHT = MODEL_HEIGHT/2.0f;
@@ -58,18 +65,24 @@ public final class Main extends JFrame {
 		super("metaballs");
 	}
 
-	public static void main(String[] args) {
+	public static void main(String[] args) throws Exception {
 		new Main().run();
 	}
 
 	protected final class MyPanel extends JPanel {
 
-		protected int frameCount;
-		protected long totalTime = 0;
+		protected final Object BUFFER_LOCK = new Object();
 
-		protected final BufferedImage bufferImage;
-		protected final Graphics2D bufferGraphics;
+		// @GuardedBy( BUFFER_LOCK )
+		protected BufferedImage[] bufferImage;
+		// @GuardedBy( BUFFER_LOCK )
+		protected Graphics2D[] bufferGraphics;
+		// @GuardedBy( BUFFER_LOCK )
+		protected int currentBufferIdx;
+		// @GuardedBy( BUFFER_LOCK )
+		protected BufferedImage tmpImage;
 
+		protected volatile boolean gaussianBlur = true;
 		protected volatile boolean useGradient = false;
 
 		protected final int sliceCount;
@@ -77,6 +90,9 @@ public final class Main extends JFrame {
 		protected final int[] colors = new int[256];
 
 		protected final ThreadPoolExecutor threadPool;
+		
+		private ConvolveOp horizontalBlur;
+		private ConvolveOp verticalBlur;
 
 		public MyPanel()
 		{
@@ -89,10 +105,15 @@ public final class Main extends JFrame {
 				{
 					if ( e.getKeyChar() == 'g' ) {
 						useGradient = !useGradient;
+					} else if ( e.getKeyChar() == 'b' ) {
+						gaussianBlur = !gaussianBlur;
 					}
 				}
 			});
 
+			horizontalBlur = createGaussianBlurFilter( 2 , true );
+			verticalBlur = createGaussianBlurFilter( 2 , false );
+			
 			// setup colors
 			for ( int i=0; i < 256 ; i++ )
 			{
@@ -101,10 +122,6 @@ public final class Main extends JFrame {
 				final int b = 0;
 				colors[i] = r << 16 | g << 8 | b;
 			}
-
-			// setup background image
-			bufferImage = new BufferedImage( (int) MODEL_WIDTH , (int) MODEL_HEIGHT , BufferedImage.TYPE_INT_RGB );
-			bufferGraphics = bufferImage.createGraphics();
 
 			// setup worker thread pool
 			final BlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>( 100 );
@@ -128,123 +145,210 @@ public final class Main extends JFrame {
 			sliceCount = cpuCount;
 			System.out.println("Using "+cpuCount+" threads and "+sliceCount+" slices");
 		}
+		
+		/**
+		 * Kernel calculation taken from http://www.java2s.com/Code/Java/Advanced-Graphics/GaussianBlurDemo.htm
+		 * 
+		 * Copyright (c) 2007, Romain Guy
+		 * 
+		 * @param radius
+		 * @param horizontal
+		 * @return
+		 */
+		 protected ConvolveOp createGaussianBlurFilter(int radius,boolean horizontal) 
+		 {
+		        if (radius < 1) {
+		            throw new IllegalArgumentException("Radius must be >= 1");
+		        }
+		        
+		        int size = radius * 2 + 1;
+		        System.out.println("Blur kernel size: "+size+"x"+size);
+		        float[] data = new float[size];
+		        
+		        float sigma = radius / 3.0f;
+		        float twoSigmaSquare = 2.0f * sigma * sigma;
+		        float sigmaRoot = (float) Math.sqrt(twoSigmaSquare * Math.PI);
+		        float total = 0.0f;
+		        
+		        for (int i = -radius; i <= radius; i++) {
+		            float distance = i * i;
+		            int index = i + radius;
+		            data[index] = (float) Math.exp(-distance / twoSigmaSquare) / sigmaRoot;
+		            total += data[index];
+		        }
+		        
+		        for (int i = 0; i < data.length; i++) {
+		            data[i] /= total;
+		        }        
+		        
+		        Kernel kernel = null;
+		        if (horizontal) {
+		            kernel = new Kernel(size, 1, data);
+		        } else {
+		            kernel = new Kernel(1, size, data);
+		        }
+		        return new ConvolveOp(kernel, ConvolveOp.EDGE_NO_OP, null);
+		    }		
 
-		protected int[] getPixelDataArray() {
+		protected int[] getPixelDataArray(BufferedImage bufferImage) {
 			return ((DataBufferInt) bufferImage.getRaster().getDataBuffer()).getData();
+		}
+
+		private void maybeInit() 
+		{
+			final int w = getWidth();
+			final int h = getHeight();
+
+			if ( bufferImage == null ) 
+			{
+				if ( bufferGraphics != null ) 
+				{
+					bufferGraphics[0].dispose();
+					bufferGraphics[1].dispose();
+				} else {
+					bufferImage = new BufferedImage[2];
+					bufferGraphics = new Graphics2D[2];
+				}
+				
+				bufferImage[0] = createBufferedImage((int) MODEL_WIDTH , (int) MODEL_HEIGHT );// new BufferedImage( (int) MODEL_WIDTH , (int) MODEL_HEIGHT , BufferedImage.TYPE_INT_RGB );
+				bufferImage[1] = createBufferedImage((int) MODEL_WIDTH , (int) MODEL_HEIGHT );
+				tmpImage = createBufferedImage((int) MODEL_WIDTH , (int) MODEL_HEIGHT );
+				
+				bufferGraphics[0] = bufferImage[0].createGraphics();
+				bufferGraphics[1] = bufferImage[1].createGraphics();
+
+				bufferGraphics[0].setColor( Color.WHITE );
+				bufferGraphics[0].fillRect(0 , 0, w , h );
+
+				bufferGraphics[1].setColor( Color.WHITE );
+				bufferGraphics[1].fillRect(0 , 0, w , h );					
+			}
+		}
+
+		public void render(float deltaSeconds) 
+		{
+			synchronized ( BUFFER_LOCK ) 
+			{
+				maybeInit();
+				
+				final float w = MODEL_WIDTH;
+				final float h = MODEL_HEIGHT;
+
+				final int width = (int) MODEL_WIDTH;
+				final int height = (int) MODEL_HEIGHT;
+				
+				final BufferedImage bufferImage = getBackBuffer();
+
+				final Graphics2D graphics = getBackBufferGraphics();
+				graphics.setColor( Color.WHITE );
+				graphics.fillRect(0 , 0, bufferImage.getWidth() , bufferImage.getHeight() );					
+
+				final List<Rectangle> slices = createSlices( width , height , sliceCount );
+				final CountDownLatch latch = new CountDownLatch( slices.size() );
+				for ( final Rectangle r : slices )
+				{
+					final Runnable runnable = new Runnable()
+					{
+						@Override
+						public void run() {
+							try
+							{
+								final int startX = r.x;
+								final int startY = r.y;
+
+								final int endX = startX + r.width;
+								final int endY = startY + r.height;
+
+								final int[] pixelData = getPixelDataArray( bufferImage );
+
+								final int intsPerLine = bufferImage.getWidth();
+								final boolean USE_GRADIENT = useGradient;
+								for ( int y = startY ; y < endY ; y++ )
+								{
+									final float modelY = ( y/h - 0.5f ) * MODEL_HEIGHT;
+									int offset = startX + y*intsPerLine;
+									for ( int x = startX ; x < endX ; x++,offset++ )
+									{
+										final float modelX = ( x/w - 0.5f ) * MODEL_WIDTH;
+
+										final float density = getDensity( modelX ,  modelY );
+										if ( USE_GRADIENT || density > 1.5f )
+										{
+											int colorIdx = (int) ( (1-(1f/density))*255f );
+											if ( USE_GRADIENT )
+											{
+												if ( colorIdx > 255 )
+												{
+													colorIdx = 255;
+												}
+												else if ( colorIdx < 0 )
+												{
+													colorIdx = 0;
+												}
+											} else {
+												colorIdx = 255;
+											}
+											pixelData[offset] = colors[ colorIdx ];
+										}
+									}
+								}
+							} finally {
+								latch.countDown();
+							}
+						}
+
+					};
+
+					 threadPool.submit( runnable );
+				}
+
+				try
+				{
+					latch.await();
+				} catch (final InterruptedException e) {
+					e.printStackTrace();
+				}	
+
+				if ( gaussianBlur ) {
+					horizontalBlur.filter( bufferImage , tmpImage );
+					verticalBlur.filter( tmpImage , bufferImage );
+				}
+				swapBuffers();
+			}
+		}
+		
+		private BufferedImage createBufferedImage(int width,int height) {
+			final GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+			final GraphicsConfiguration gc = ge.getDefaultScreenDevice().getDefaultConfiguration();
+			final BufferedImage img = gc.createCompatibleImage(width, height, Transparency.OPAQUE);
+			img.setAccelerationPriority(1);
+			return img;
+		}
+
+		private BufferedImage getFrontBuffer() {
+			return bufferImage[ (currentBufferIdx+1) % 2 ];
+		}
+
+		private Graphics2D getBackBufferGraphics() {
+			return bufferGraphics[ currentBufferIdx ];
+		}	
+
+		private BufferedImage getBackBuffer() {
+			return bufferImage[ currentBufferIdx ];
+		}		
+
+		private void swapBuffers() {
+			currentBufferIdx = (currentBufferIdx+1) % 2;
 		}
 
 		@Override
 		protected void paintComponent(Graphics g)
 		{
-			final long startTime = System.currentTimeMillis();
-
-			final float w = MODEL_WIDTH;
-			final float h = MODEL_HEIGHT;
-
-			final int width = (int) MODEL_WIDTH;
-			final int height = (int) MODEL_HEIGHT;
-
-			final long calcStart = System.currentTimeMillis();
-			final List<Rectangle> slices = createSlices( width , height , sliceCount );
-
-			final CountDownLatch latch = new CountDownLatch( slices.size() );
-			for ( final Rectangle r : slices )
-			{
-				final Runnable runnable = new Runnable()
-				{
-					@Override
-					public void run() {
-						try
-						{
-							final int startX = r.x;
-							final int startY = r.y;
-
-							final int endX = startX + r.width;
-							final int endY = startY + r.height;
-
-							final int[] pixelData = getPixelDataArray();
-
-							final int intsPerLine = bufferImage.getWidth();
-							final boolean USE_GRADIENT = useGradient;
-							for ( int y = startY ; y < endY ; y++ )
-							{
-								final float modelY = ( y/h - 0.5f ) * MODEL_HEIGHT;
-								int offset = startX + y*intsPerLine;
-								for ( int x = startX ; x < endX ; x++,offset++ )
-								{
-									final float modelX = ( x/w - 0.5f ) * MODEL_WIDTH;
-
-									final float density = getDensity( modelX ,  modelY );
-									if ( USE_GRADIENT || density > 1 )
-									{
-										int colorIdx = (int) ( (1-(1f/density))*255f );
-										if ( USE_GRADIENT )
-										{
-											if ( colorIdx > 255 )
-											{
-												colorIdx = 255;
-											}
-											else if ( colorIdx < 0 )
-											{
-												colorIdx = 0;
-											}
-										} else {
-											colorIdx = 255;
-										}
-										pixelData[offset] = colors[ colorIdx ];
-									}
-								}
-							}
-						} finally {
-							latch.countDown();
-						}
-					}
-
-				};
-				threadPool.submit( runnable );
+			synchronized (BUFFER_LOCK) {
+				maybeInit();
+				g.drawImage( getFrontBuffer() , 0 , 0 , getWidth() , getHeight() , null ); // blit image
 			}
-
-			try
-			{
-				latch.await();
-			} catch (final InterruptedException e) {
-				e.printStackTrace();
-			}
-			final long now = System.currentTimeMillis();
-			final long calcTime = now - calcStart;
-
-			// render stuff
-
-			//			bufferGraphics.setColor(Color.BLUE);
-			//			for ( final Rectangle r : slices ) {
-			//				bufferGraphics.drawRect( r.x , r.y , r.width , r.height );
-			//			}
-
-			g.drawImage( bufferImage , 0 , 0 , getWidth() , getHeight() , null ); // blit image
-
-			bufferGraphics.setColor(Color.WHITE);
-			bufferGraphics.fillRect( 0 , 0 , width ,height );
-
-			final long now2 = System.currentTimeMillis();
-			final long renderTime = now2- now;
-			final long delta = now2 - startTime;
-
-			totalTime += delta;
-			frameCount++;
-			final int fps = (int) ( 1000.0f/ ( totalTime / (float) frameCount ) );
-
-			g.setColor( Color.BLUE );
-			final StringBuilder stringBuilder = new StringBuilder().append("FPS: ").append(fps).append(" (").append(delta).append(" ms total, ").append(calcTime ).append(" ms calc, ").append(renderTime).append(" ms rendering)  |  Press 'g' to toggle gradient display  |  Press <SPACE> to halt animation");
-			g.drawString(stringBuilder.toString(),10,10);
-
-			// debugging
-			if ( BENCHMARK_MODE && frameCount >= BENCHMARK_FRAMES ) {
-				final long timeDelta = System.currentTimeMillis() - startup;
-				final int fps2 = (int) ( 1000.0f/ ( timeDelta / (float) frameCount ) );
-				System.out.println("Rendered "+frameCount+" frames in "+(timeDelta/1000f)+" seconds , "+fps2+" fps");
-				System.out.println("Benchmark finished.");
-				System.exit(0);
-			}
+			Toolkit.getDefaultToolkit().sync();
 		}
 
 		protected float getDensity(float x,float y)
@@ -316,7 +420,7 @@ public final class Main extends JFrame {
 		return result;
 	}
 
-	public void run()
+	public void run() throws InvocationTargetException, InterruptedException
 	{
 		// setup random meta-balls
 		final Random rnd = new Random(System.currentTimeMillis());
@@ -324,8 +428,10 @@ public final class Main extends JFrame {
 		for ( int i = 0 ; i < BALL_COUNT ; i++ )
 		{
 			final float r = MIN_RADIUS + rnd.nextFloat()*(MAX_RADIUS-MIN_RADIUS);
-			final float x = (rnd.nextFloat() * MODEL_WIDTH) - (MODEL_WIDTH/2.0f);
-			final float y = (rnd.nextFloat() * MODEL_HEIGHT) - (MODEL_HEIGHT/2.0f);
+			final float tx = rnd.nextFloat() * (MODEL_WIDTH-r);
+			final float ty = rnd.nextFloat() * (MODEL_HEIGHT-r);
+			final float x = tx - (MODEL_WIDTH/2.0f);
+			final float y = ty - (MODEL_HEIGHT/2.0f);
 
 			final float vx = MIN_VELOCITY + rnd.nextFloat()*(MAX_VELOCITY-MIN_VELOCITY);
 			final float vy = MIN_VELOCITY + rnd.nextFloat()*(MAX_VELOCITY-MIN_VELOCITY);
@@ -364,26 +470,38 @@ public final class Main extends JFrame {
 
 		setVisible(true);
 
-		final IVisitor mover = new IVisitor() {
-
-			@Override
-			public void visit(MetaBall ball) {
-				ball.move( MIN, MAX );
-			}
-
-			@Override
-			public float getResult() { return 0; }
-		};
-
-		final Timer timer = new Timer(16, event ->
+		long previous = System.nanoTime();
+		float agg = 0;
+		while ( true ) 
 		{
-			if ( ! paused.get() )
-			{
+			long now = System.nanoTime();
+			final float elapsedSeconds = Math.abs( now - previous ) / 1_000_000_000f;
+			previous = now;
+			agg += elapsedSeconds;
+			
+			final IVisitor mover = new IVisitor() {
+
+				@Override
+				public void visit(MetaBall ball) {
+					ball.move( MIN, MAX , elapsedSeconds );
+				}
+
+				@Override
+				public float getResult() { return 0; }
+			};
+			
+			if ( ! paused.get() ) {
 				grid.visitAll( mover );
 				grid.refresh();
-				panel.repaint();
 			}
-		});
-		timer.start();
+			
+			panel.render( elapsedSeconds );
+			
+			if ( agg > 1.0f/60f) 
+			{
+				SwingUtilities.invokeAndWait( () -> panel.repaint() );
+				agg -= 1.0f/60f;
+			}
+		}
 	}
 }

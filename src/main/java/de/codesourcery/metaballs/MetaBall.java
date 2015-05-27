@@ -21,23 +21,28 @@ public class MetaBall {
 		return dx*dx+dy*dy;
 	}
 
-	public void move(Vec2d min,Vec2d max) {
+	public void move(Vec2d min,Vec2d max,float deltaSeconds) {
 
-		float newX = position.x + velocity.x;
+		float dx = deltaSeconds*velocity.x;
+		float dy = deltaSeconds*velocity.y;
+		
+		float newX = position.x + dx;
+		float newY = position.y + dy;
+		
 		if ( (newX-radius) < min.x ) {
-			newX = position.x - velocity.x;
+			newX = position.x - dx;
 			velocity.x = -velocity.x;
 		} else if ( (newX+radius) > max.x ) {
-			newX = position.x - velocity.x;
+			newX = position.x - dx;
 			velocity.x = -velocity.x;
 		}
 
-		float newY = position.y + velocity.y;
+
 		if ( (newY-radius) < min.y ) {
-			newY = position.y - velocity.y;
+			newY = position.y - dy;
 			velocity.y = -velocity.y;
 		} else if ( (newY+radius) > max.y ) {
-			newY = position.y - velocity.y;
+			newY = position.y - dy;
 			velocity.y = -velocity.y;
 		}
 		position.x = newX;
